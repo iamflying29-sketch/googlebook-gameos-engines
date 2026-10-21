@@ -29,7 +29,7 @@ jobs:
             xz-utils patch binutils file autoconf automake pkgconf perl \
             gcc-mingw-w64-x86-64 gcc-mingw-w64-i686 \
             libvulkan-dev libwayland-dev libwayland-bin wayland-protocols libxkbcommon-dev libxkbregistry-dev \
-            libegl-dev libfreetype-dev libgnutls28-dev
+            libegl-dev libfreetype-dev libgnutls28-dev libdrm-dev
       - uses: actions/checkout@v4
       - name: Build Wine
         run: WORK=$PWD/work OUT=$PWD/out JOBS=$(nproc) wine/build.sh
