@@ -1,0 +1,39 @@
+name: GameOS Mesa (Intel Vulkan)
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "runtime/mesa/**"
+      - ".github/workflows/mesa.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    container: debian:trixie
+    timeout-minutes: 120
+    steps:
+      - name: Install build tools
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends gcc g++ meson ninja-build pkgconf python3 python3-mako python3-yaml \
+            python3-packaging python3-ply bison flex glslang-tools spirv-tools curl ca-certificates xz-utils binutils \
+            libdrm-dev libexpat1-dev libzstd-dev zlib1g-dev libudev-dev libwayland-dev libwayland-bin wayland-protocols \
+            llvm-dev libclang-dev clang libclc-19-dev libllvmspirvlib-19-dev
+      - uses: actions/checkout@v4
+      - name: Build Mesa
+        run: WORK=$PWD/work OUT=$PWD/out JOBS=$(nproc) runtime/mesa/build.sh
+      - name: Package
+        run: |
+          cd out
+          D=$(ls -d mesa-* | tail -1)
+          tar -cJf "gameos-$D-x86_64.tar.xz" "$D"
+          sha256sum "gameos-$D-x86_64.tar.xz" > "gameos-$D-x86_64.tar.xz.sha256"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gameos-mesa
+          path: out/gameos-mesa-*
+          retention-days: 30
