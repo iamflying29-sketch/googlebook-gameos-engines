@@ -16,6 +16,7 @@ and every result is published as a release with a SHA-256 checksum. GameOS downl
 | Mesa Intel Vulkan driver | GameOS's own up-to-date graphics driver for the Googlebook's Intel GPU | Next |
 | Wine with Proton's patches | Runs Windows games, including 32-bit ones | Next |
 | DXVK and VKD3D-Proton | Direct3D 8 to 12 on Vulkan | Next |
+| GameOS Sync | Windows synchronization at ntsync quality without `/dev/ntsync` (see `sync/`) | Working and crash-tested |
 
 ## Why GameOS needs its own glibc
 
