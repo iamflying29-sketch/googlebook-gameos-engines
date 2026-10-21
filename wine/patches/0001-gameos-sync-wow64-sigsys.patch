@@ -1,0 +1,484 @@
+diff --git a/dlls/ntdll/Makefile.in b/dlls/ntdll/Makefile.in
+index 38c865b..e897c57 100644
+--- a/dlls/ntdll/Makefile.in
++++ b/dlls/ntdll/Makefile.in
+@@ -51,6 +51,8 @@ SOURCES = \
+ 	unix/env.c \
+ 	unix/file.c \
+ 	unix/fsync.c \
++	unix/gameos_ntsync.c \
++	unix/gsync.c \
+ 	unix/loader.c \
+ 	unix/loadorder.c \
+ 	unix/process.c \
+diff --git a/dlls/ntdll/unix/server.c b/dlls/ntdll/unix/server.c
+index 112157b..7045ef7 100644
+--- a/dlls/ntdll/unix/server.c
++++ b/dlls/ntdll/unix/server.c
+@@ -79,6 +79,7 @@
+ #include "wine/server.h"
+ #include "wine/debug.h"
+ #include "unix_private.h"
++#include "gameos_ntsync.h"
+ #include "ddk/wdm.h"
+ 
+ #include "fsync.h"
+@@ -1707,6 +1708,7 @@ size_t server_init_process(void)
+             {
+                 inproc_device_fd = wine_server_receive_fd( &handle );
+                 assert( handle == reply->inproc_device );
++                gameos_gsync_client_open( inproc_device_fd ); /* GameOS Sync region, or a real ntsync device */
+             }
+         }
+     }
+diff --git a/dlls/ntdll/unix/signal_x86_64.c b/dlls/ntdll/unix/signal_x86_64.c
+index 110404c..f7feeb3 100644
+--- a/dlls/ntdll/unix/signal_x86_64.c
++++ b/dlls/ntdll/unix/signal_x86_64.c
+@@ -103,6 +103,16 @@ static USHORT cs32_sel;  /* selector for %cs in 32-bit mode */
+ static USHORT cs64_sel;  /* selector for %cs in 64-bit mode */
+ static USHORT ds64_sel;  /* selector for %ds/%es/%ss in 64-bit mode */
+ static USHORT fs32_sel;  /* selector for %fs in 32-bit mode */
++#ifdef __linux__
++/* GameOS: some kernels (GooglebookOS on Android) have no 32-bit system call gate, so set_thread_area cannot create
++   a TLS segment. With FSGSBASE, %fs is loaded with the kernel's 32-bit data selector and its hidden base is set to
++   the 32-bit TEB with wrfsbase. Proven on the device: 4.3 billion 32-bit reads through %fs, 0 mismatches. */
++static BOOL use_fsbase32;
++#define GAMEOS_USER32_DS 0x2b
++/* GameOS: Wine's own seccomp traps carry this value in si_errno; other SIGSYS (Android's filter) are chained. */
++#define GAMEOS_WINE_TRAP_DATA 0x4757
++static struct sigaction gameos_prev_sigsys;
++#endif
+ 
+ /***********************************************************************
+  * signal context platform-specific definitions
+@@ -518,6 +528,7 @@ struct amd64_thread_data
+     void                **instrumentation_callback; /* 0330 */
+     DWORD                 fs;            /* 0338 WOW TEB selector */
+     DWORD                 mxcsr;         /* 033c Unix-side mxcsr register */
++    ULONG_PTR             fs32_base;     /* 0340 GameOS: 32-bit TEB base set with wrfsbase, 0 if unused */
+ };
+ 
+ C_ASSERT( sizeof(struct amd64_thread_data) <= sizeof(((struct ntdll_thread_data *)0)->cpu_data) );
+@@ -526,6 +537,7 @@ C_ASSERT( offsetof( TEB, GdiTebBatch ) + offsetof( struct amd64_thread_data, fra
+ C_ASSERT( offsetof( TEB, GdiTebBatch ) + offsetof( struct amd64_thread_data, instrumentation_callback ) == 0x330 );
+ C_ASSERT( offsetof( TEB, GdiTebBatch ) + offsetof( struct amd64_thread_data, fs ) == 0x338 );
+ C_ASSERT( offsetof( TEB, GdiTebBatch ) + offsetof( struct amd64_thread_data, mxcsr ) == 0x33c );
++C_ASSERT( offsetof( TEB, GdiTebBatch ) + offsetof( struct amd64_thread_data, fs32_base ) == 0x340 );
+ 
+ static inline struct amd64_thread_data *amd64_thread_data(void)
+ {
+@@ -955,7 +967,10 @@ static inline void leave_handler( ucontext_t *sigcontext )
+     if (fs32_sel &&
+         !is_inside_signal_stack( (void *)RSP_sig(sigcontext )) &&
+         !is_inside_syscall( RSP_sig(sigcontext) ))
++    {
+         __asm__ volatile( "movw %0,%%fs" :: "r" (fs32_sel) );
++        if (use_fsbase32) __asm__ volatile( "wrfsbase %0" :: "r" (amd64_thread_data()->fs32_base) );
++    }
+ #elif defined __APPLE__
+     if (!is_inside_signal_stack( (void *)RSP_sig(sigcontext )) &&
+         !is_inside_syscall( RSP_sig(sigcontext )))
+@@ -1837,6 +1852,10 @@ __ASM_GLOBAL_FUNC( call_user_mode_callback,
+                    "testw %ax,%ax\n\t"
+                    "jz 1f\n\t"
+                    "movw %ax,%fs\n"
++                   "movq 0x340(%r13),%rax\n\t" /* GameOS: amd64_thread_data()->fs32_base */
++                   "testq %rax,%rax\n\t"
++                   "jz 1f\n\t"
++                   "wrfsbase %rax\n"
+                    "1:\n\t"
+ #elif defined __APPLE__
+                    "movq %rcx,%r10\n\t"
+@@ -2047,6 +2066,15 @@ static inline DWORD is_privileged_instr( CONTEXT *context )
+ static void sigsys_handler( int signal, siginfo_t *siginfo, void *sigcontext )
+ {
+     extern const void *__wine_syscall_dispatcher_prolog_end_ptr;
++    if (siginfo->si_errno != GAMEOS_WINE_TRAP_DATA)
++    {
++        /* GameOS: trapped by the host's filter (Android), not by Wine's: let the runtime translate it. */
++        if ((gameos_prev_sigsys.sa_flags & SA_SIGINFO) && gameos_prev_sigsys.sa_sigaction)
++            gameos_prev_sigsys.sa_sigaction( signal, siginfo, sigcontext );
++        else
++            RAX_sig( (ucontext_t *)sigcontext ) = -ENOSYS;
++        return;
++    }
+     ucontext_t *ucontext = init_handler( sigcontext );
+     struct syscall_frame *frame = get_syscall_frame();
+ 
+@@ -2144,9 +2172,9 @@ static void install_bpf(struct sigaction *sig_act)
+         /* Allow wine64-preloader */
+         BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, instruction_pointer)),
+         BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 0x7d400000, 1, 0),
+-        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_TRAP),
++        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_TRAP | GAMEOS_WINE_TRAP_DATA),
+         BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 0x7d402000, 0, 1),
+-        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_TRAP),
++        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_TRAP | GAMEOS_WINE_TRAP_DATA),
+         BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+     };
+     long (*test_syscall)(long sc_number);
+@@ -2165,7 +2193,7 @@ static void install_bpf(struct sigaction *sig_act)
+     sig_act->sa_sigaction = sigsys_handler;
+     memset(&prog, 0, sizeof(prog));
+ 
+-    sigaction(SIGSYS, sig_act, NULL);
++    sigaction(SIGSYS, sig_act, &gameos_prev_sigsys);
+ 
+     test_syscall = mmap((void *)0x600000000000, 0x1000, PROT_EXEC | PROT_READ | PROT_WRITE,
+             MAP_FIXED_NOREPLACE | MAP_PRIVATE | MAP_ANON, -1, 0);
+@@ -3095,6 +3123,9 @@ NTSTATUS signal_alloc_thread( TEB *teb )
+             if (!thread_data->fs) return STATUS_TOO_MANY_THREADS;
+         }
+         else thread_data->fs = fs32_sel;
++#ifdef __linux__
++        if (use_fsbase32) thread_data->fs32_base = (ULONG_PTR)wow_teb;
++#endif
+     }
+     thread_data->frame_size = frame_size;
+     return STATUS_SUCCESS;
+@@ -3156,7 +3187,12 @@ void signal_init_process(void)
+     {
+ #ifdef __linux__
+         cs32_sel = 0x23;
+-        fs32_sel = alloc_fs_sel( -1, wow_teb );
++        if (getauxval( AT_HWCAP2 ) & 2 /* HWCAP2_FSGSBASE */ && getenv( "GAMEOS_FSBASE32" ))
++        {
++            use_fsbase32 = TRUE;
++            fs32_sel = GAMEOS_USER32_DS;
++        }
++        else fs32_sel = alloc_fs_sel( -1, wow_teb );
+ #elif defined(__APPLE__)
+         cs32_sel = ldt_alloc_entry( ldt_make_cs32_entry() );
+ #endif
+@@ -3219,7 +3255,7 @@ void init_syscall_frame( LPTHREAD_START_ROUTINE entry, void *arg, BOOL suspend,
+     if (fs32_sel)
+     {
+         arch_prctl( ARCH_GET_FS, &thread_data->pthread_teb );
+-        alloc_fs_sel( fs32_sel >> 3, get_wow_teb( teb ));
++        if (!use_fsbase32) alloc_fs_sel( fs32_sel >> 3, get_wow_teb( teb ));
+     }
+ #elif defined (__FreeBSD__) || defined (__FreeBSD_kernel__)
+     amd64_set_gsbase( teb );
+@@ -3499,6 +3535,10 @@ __ASM_GLOBAL_FUNC( __wine_syscall_dispatcher,
+                    "testw %dx,%dx\n\t"
+                    "jz 1f\n\t"
+                    "movw %dx,%fs\n"
++                   "movq 0x340(%r13),%rdx\n\t"     /* GameOS: amd64_thread_data()->fs32_base */
++                   "testq %rdx,%rdx\n\t"
++                   "jz 1f\n\t"
++                   "wrfsbase %rdx\n"
+                    "1:\n\t"
+ #elif defined __APPLE__
+                    "movq %rax,%r8\n\t"
+@@ -3767,6 +3807,10 @@ __ASM_GLOBAL_FUNC( __wine_unix_call_dispatcher,
+                    "testw %dx,%dx\n\t"
+                    "jz 1f\n\t"
+                    "movw %dx,%fs\n"
++                   "movq 0x340(%r13),%rdx\n\t"     /* GameOS: amd64_thread_data()->fs32_base */
++                   "testq %rdx,%rdx\n\t"
++                   "jz 1f\n\t"
++                   "wrfsbase %rdx\n"
+                    "1:\n\t"
+ #elif defined __APPLE__
+                    "movq %rax,%rdx\n\t"
+diff --git a/dlls/ntdll/unix/sync.c b/dlls/ntdll/unix/sync.c
+index 67ab945..cc672ce 100644
+--- a/dlls/ntdll/unix/sync.c
++++ b/dlls/ntdll/unix/sync.c
+@@ -62,6 +62,7 @@
+ #endif
+ 
+ # include "ntsync_tmp.h"
++# include "gameos_ntsync.h"
+ 
+ #include "ntstatus.h"
+ #define WIN32_NO_STATUS
+@@ -314,7 +315,7 @@ static unsigned int validate_open_object_attributes( const OBJECT_ATTRIBUTES *at
+ 
+ static NTSTATUS linux_release_semaphore_obj( int obj, ULONG count, ULONG *prev_count )
+ {
+-    if (ioctl( obj, NTSYNC_IOC_SEM_RELEASE, &count ) < 0)
++    if (gameos_ntsync_ioctl( obj, NTSYNC_IOC_SEM_RELEASE, &count ) < 0)
+     {
+         if (errno == EOVERFLOW) return STATUS_SEMAPHORE_LIMIT_EXCEEDED;
+         return errno_to_status( errno );
+@@ -326,7 +327,7 @@ static NTSTATUS linux_release_semaphore_obj( int obj, ULONG count, ULONG *prev_c
+ static NTSTATUS linux_query_semaphore_obj( int obj, SEMAPHORE_BASIC_INFORMATION *info )
+ {
+     struct ntsync_sem_args args = {0};
+-    if (ioctl( obj, NTSYNC_IOC_SEM_READ, &args ) < 0) return errno_to_status( errno );
++    if (gameos_ntsync_ioctl( obj, NTSYNC_IOC_SEM_READ, &args ) < 0) return errno_to_status( errno );
+     info->CurrentCount = args.count;
+     info->MaximumCount = args.max;
+     return STATUS_SUCCESS;
+@@ -335,7 +336,7 @@ static NTSTATUS linux_query_semaphore_obj( int obj, SEMAPHORE_BASIC_INFORMATION
+ static NTSTATUS linux_set_event_obj( int obj, LONG *prev_state )
+ {
+     __u32 prev;
+-    if (ioctl( obj, NTSYNC_IOC_EVENT_SET, &prev ) < 0) return errno_to_status( errno );
++    if (gameos_ntsync_ioctl( obj, NTSYNC_IOC_EVENT_SET, &prev ) < 0) return errno_to_status( errno );
+     if (prev_state) *prev_state = prev;
+     return STATUS_SUCCESS;
+ }
+@@ -343,7 +344,7 @@ static NTSTATUS linux_set_event_obj( int obj, LONG *prev_state )
+ static NTSTATUS linux_reset_event_obj( int obj, LONG *prev_state )
+ {
+     __u32 prev;
+-    if (ioctl( obj, NTSYNC_IOC_EVENT_RESET, &prev ) < 0) return errno_to_status( errno );
++    if (gameos_ntsync_ioctl( obj, NTSYNC_IOC_EVENT_RESET, &prev ) < 0) return errno_to_status( errno );
+     if (prev_state) *prev_state = prev;
+     return STATUS_SUCCESS;
+ }
+@@ -351,7 +352,7 @@ static NTSTATUS linux_reset_event_obj( int obj, LONG *prev_state )
+ static NTSTATUS linux_pulse_event_obj( int obj, LONG *prev_state )
+ {
+     __u32 prev;
+-    if (ioctl( obj, NTSYNC_IOC_EVENT_PULSE, &prev ) < 0) return errno_to_status( errno );
++    if (gameos_ntsync_ioctl( obj, NTSYNC_IOC_EVENT_PULSE, &prev ) < 0) return errno_to_status( errno );
+     if (prev_state) *prev_state = prev;
+     return STATUS_SUCCESS;
+ }
+@@ -359,7 +360,7 @@ static NTSTATUS linux_pulse_event_obj( int obj, LONG *prev_state )
+ static NTSTATUS linux_query_event_obj( int obj, EVENT_BASIC_INFORMATION *info )
+ {
+     struct ntsync_event_args args = {0};
+-    if (ioctl( obj, NTSYNC_IOC_EVENT_READ, &args ) < 0) return errno_to_status( errno );
++    if (gameos_ntsync_ioctl( obj, NTSYNC_IOC_EVENT_READ, &args ) < 0) return errno_to_status( errno );
+     info->EventType = args.manual ? NotificationEvent : SynchronizationEvent;
+     info->EventState = args.signaled;
+     return STATUS_SUCCESS;
+@@ -368,7 +369,7 @@ static NTSTATUS linux_query_event_obj( int obj, EVENT_BASIC_INFORMATION *info )
+ static NTSTATUS linux_release_mutex_obj( int obj, LONG *prev_count )
+ {
+     struct ntsync_mutex_args args = {.owner = GetCurrentThreadId()};
+-    if (ioctl( obj, NTSYNC_IOC_MUTEX_UNLOCK, &args ) < 0)
++    if (gameos_ntsync_ioctl( obj, NTSYNC_IOC_MUTEX_UNLOCK, &args ) < 0)
+     {
+         if (errno == EOVERFLOW) return STATUS_MUTANT_LIMIT_EXCEEDED;
+         if (errno == EPERM) return STATUS_MUTANT_NOT_OWNED;
+@@ -381,7 +382,7 @@ static NTSTATUS linux_release_mutex_obj( int obj, LONG *prev_count )
+ static NTSTATUS linux_query_mutex_obj( int obj, MUTANT_BASIC_INFORMATION *info )
+ {
+     struct ntsync_mutex_args args = {0};
+-    if (ioctl( obj, NTSYNC_IOC_MUTEX_READ, &args ) < 0)
++    if (gameos_ntsync_ioctl( obj, NTSYNC_IOC_MUTEX_READ, &args ) < 0)
+     {
+         if (errno == EOWNERDEAD)
+         {
+@@ -430,7 +431,7 @@ static NTSTATUS linux_wait_objs( int device, DWORD count, const int *objs, WAIT_
+     if (type != WaitAll || count == 1) request = NTSYNC_IOC_WAIT_ANY;
+     else request = NTSYNC_IOC_WAIT_ALL;
+ 
+-    do { ret = ioctl( device, request, &args ); }
++    do { ret = gameos_ntsync_ioctl( device, request, &args ); }
+     while (ret < 0 && errno == EINTR);
+ 
+     if (!ret)
+@@ -636,7 +637,7 @@ static void release_inproc_sync( struct inproc_sync *sync )
+     LONG ref = InterlockedDecrement( &sync->refcount );
+ 
+     assert( ref >= 0 );
+-    if (!ref) close( fd );
++    if (!ref) gameos_ntsync_close( fd );
+ }
+ 
+ static struct inproc_sync *get_cached_inproc_sync( HANDLE handle )
+@@ -677,8 +678,12 @@ static NTSTATUS get_server_inproc_sync( HANDLE handle, struct inproc_sync *sync
+         {
+             obj_handle_t fd_handle;
+             sync->refcount = 1;
+-            sync->fd = wine_server_receive_fd( &fd_handle );
+-            assert( wine_server_ptr_handle(fd_handle) == handle );
++            if (gameos_gsync_active()) sync->fd = reply->fsync_shm_idx; /* GameOS Sync handle */
++            else
++            {
++                sync->fd = wine_server_receive_fd( &fd_handle );
++                assert( wine_server_ptr_handle(fd_handle) == handle );
++            }
+             sync->access = reply->access;
+             sync->type = reply->type;
+             sync->closed = 0;
+@@ -907,7 +912,7 @@ int get_inproc_alert_fd(void)
+         {
+             if (!server_call_unlocked( req ))
+             {
+-                if (do_fsync()) data->alert_fd = fd = reply->fsync_shm_idx;
++                if (do_fsync() || gameos_gsync_active()) data->alert_fd = fd = reply->fsync_shm_idx;
+                 else
+                 {
+                     data->alert_fd = fd = wine_server_receive_fd( &token );
+diff --git a/dlls/ntdll/unix/thread.c b/dlls/ntdll/unix/thread.c
+index 9ee9239..fe9f2a7 100644
+--- a/dlls/ntdll/unix/thread.c
++++ b/dlls/ntdll/unix/thread.c
+@@ -76,6 +76,7 @@
+ #include "wine/server.h"
+ #include "wine/debug.h"
+ #include "unix_private.h"
++#include "gameos_ntsync.h"
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(thread);
+ WINE_DECLARE_DEBUG_CHANNEL(seh);
+@@ -1105,7 +1106,8 @@ static void contexts_from_server( CONTEXT *context, struct context_data server_c
+  */
+ static DECLSPEC_NORETURN void pthread_exit_wrapper( int status )
+ {
+-    close( ntdll_get_thread_data()->alert_fd );
++    if (gameos_gsync_active()) ntdll_get_thread_data()->alert_fd = 0; /* GameOS Sync: the server owns the alert */
++    else close( ntdll_get_thread_data()->alert_fd );
+     close( ntdll_get_thread_data()->wait_fd[0] );
+     close( ntdll_get_thread_data()->wait_fd[1] );
+     close( ntdll_get_thread_data()->reply_fd );
+diff --git a/server/Makefile.in b/server/Makefile.in
+index d9ac607..7ab34bd 100644
+--- a/server/Makefile.in
++++ b/server/Makefile.in
+@@ -16,6 +16,8 @@ SOURCES = \
+ 	fd.c \
+ 	file.c \
+ 	fsync.c \
++	gameos_ntsync.c \
++	gsync.c \
+ 	handle.c \
+ 	hook.c \
+ 	inproc_sync.c \
+diff --git a/server/inproc_sync.c b/server/inproc_sync.c
+index a7020ef..99b380a 100644
+--- a/server/inproc_sync.c
++++ b/server/inproc_sync.c
+@@ -37,6 +37,7 @@
+ #include "fsync.h"
+ 
+ #include "ntsync_tmp.h"
++#include "gameos_ntsync.h"
+ 
+ #ifdef NTSYNC_IOC_EVENT_READ
+ 
+@@ -50,11 +51,16 @@ int get_inproc_device_fd(void)
+     static int fd = -2;
+     if (fd == -2)
+     {
+-        if (getenv( "PROTON_NO_NTSYNC" ) && atoi(getenv( "PROTON_NO_NTSYNC" )))
++        if ((fd = gameos_gsync_server_create()) >= 0)
++        {
++            do_fsync_cached = 0;
++            fprintf( stderr, "GameOS Sync: up and running.\n" );
++        }
++        else if (getenv( "PROTON_NO_NTSYNC" ) && atoi(getenv( "PROTON_NO_NTSYNC" )))
+             fd = -1;
+         else
+             fd = open( "/dev/ntsync", O_CLOEXEC | O_RDONLY );
+-        if (fd >= 0)
++        if (fd >= 0 && !gameos_gsync_active())
+         {
+             do_fsync_cached = 0;
+             fprintf( stderr, "ntsync: up and running.\n" );
+@@ -124,7 +130,7 @@ struct inproc_sync *create_inproc_internal_sync( int manual, int signaled )
+     else
+     {
+         event->type = INPROC_SYNC_INTERNAL;
+-        event->fd   = ioctl( get_inproc_device_fd(), NTSYNC_IOC_CREATE_EVENT, &args );
++        event->fd   = gameos_ntsync_ioctl( get_inproc_device_fd(), NTSYNC_IOC_CREATE_EVENT, &args );
+     }
+     list_init( &event->entry );
+ 
+@@ -151,7 +157,7 @@ struct inproc_sync *create_inproc_event_sync( int manual, int signaled )
+     else
+     {
+         event->type = INPROC_SYNC_EVENT;
+-        event->fd   = ioctl( get_inproc_device_fd(), NTSYNC_IOC_CREATE_EVENT, &args );
++        event->fd   = gameos_ntsync_ioctl( get_inproc_device_fd(), NTSYNC_IOC_CREATE_EVENT, &args );
+     }
+     list_init( &event->entry );
+ 
+@@ -178,7 +184,7 @@ struct inproc_sync *create_inproc_mutex_sync( thread_id_t owner, unsigned int co
+     else
+     {
+         mutex->type = INPROC_SYNC_MUTEX;
+-        mutex->fd   = ioctl( get_inproc_device_fd(), NTSYNC_IOC_CREATE_MUTEX, &args );
++        mutex->fd   = gameos_ntsync_ioctl( get_inproc_device_fd(), NTSYNC_IOC_CREATE_MUTEX, &args );
+     }
+     list_add_tail( &inproc_mutexes, &mutex->entry );
+ 
+@@ -206,7 +212,7 @@ struct inproc_sync *create_inproc_semaphore_sync( unsigned int initial, unsigned
+     else
+     {
+         sem->type = INPROC_SYNC_SEMAPHORE;
+-        sem->fd   = ioctl( get_inproc_device_fd(), NTSYNC_IOC_CREATE_SEM, &args );
++        sem->fd   = gameos_ntsync_ioctl( get_inproc_device_fd(), NTSYNC_IOC_CREATE_SEM, &args );
+     }
+     list_init( &sem->entry );
+ 
+@@ -231,7 +237,7 @@ void signal_inproc_sync( struct inproc_sync *sync )
+     __u32 count;
+     if (debug_level) fprintf( stderr, "set_inproc_event %d\n", sync->fd );
+     if (do_fsync()) fsync_set_event( sync->fd );
+-    else            ioctl( sync->fd, NTSYNC_IOC_EVENT_SET, &count );
++    else            gameos_ntsync_ioctl( sync->fd, NTSYNC_IOC_EVENT_SET, &count );
+ }
+ 
+ void reset_inproc_sync( struct inproc_sync *sync )
+@@ -239,7 +245,7 @@ void reset_inproc_sync( struct inproc_sync *sync )
+     __u32 count;
+     if (debug_level) fprintf( stderr, "reset_inproc_event %d\n", sync->fd );
+     if (do_fsync()) fsync_reset_event( sync->fd );
+-    else            ioctl( sync->fd, NTSYNC_IOC_EVENT_RESET, &count );
++    else            gameos_ntsync_ioctl( sync->fd, NTSYNC_IOC_EVENT_RESET, &count );
+ }
+ 
+ static int inproc_sync_signal( struct object *obj, unsigned int access, int signal )
+@@ -262,7 +268,7 @@ static void inproc_sync_destroy( struct object *obj )
+     assert( obj->ops == &inproc_sync_ops );
+     list_remove( &sync->entry );
+     if (do_fsync()) fsync_free_shm_idx( sync->fd );
+-    else            close( sync->fd );
++    else            gameos_ntsync_close( sync->fd );
+ }
+ 
+ void abandon_inproc_mutexes( thread_id_t tid )
+@@ -277,7 +283,7 @@ void abandon_inproc_mutexes( thread_id_t tid )
+     }
+ 
+     LIST_FOR_EACH_ENTRY( mutex, &inproc_mutexes, struct inproc_sync, entry )
+-        ioctl( mutex->fd, NTSYNC_IOC_MUTEX_KILL, &tid );
++        gameos_ntsync_ioctl( mutex->fd, NTSYNC_IOC_MUTEX_KILL, &tid );
+ }
+ 
+ static int get_obj_inproc_sync( struct object *obj, int *type )
+@@ -359,6 +365,7 @@ DECL_HANDLER(get_inproc_sync_fd)
+ 
+     if ((fd = get_obj_inproc_sync( obj, &reply->type )) < 0) set_error( STATUS_NOT_IMPLEMENTED );
+     else if (do_fsync()) reply->fsync_shm_idx = fsync_grab_shm_idx( fd );
++    else if (gameos_gsync_active()) reply->fsync_shm_idx = fd; /* GameOS Sync handle, not an fd */
+     else send_client_fd( current->process, fd, req->handle );
+ 
+     release_object( obj );
+diff --git a/server/thread.c b/server/thread.c
+index 5c4a6bd..04a5ed6 100644
+--- a/server/thread.c
++++ b/server/thread.c
+@@ -57,6 +57,7 @@
+ #include "handle.h"
+ #include "process.h"
+ #include "thread.h"
++#include "gameos_ntsync.h"
+ #include "request.h"
+ #include "user.h"
+ #include "security.h"
+@@ -1657,6 +1658,7 @@ void kill_thread( struct thread *thread, int violent_death )
+     }
+     kill_console_processes( thread, 0 );
+     abandon_mutexes( thread );
++    gameos_gsync_recover(); /* GameOS Sync: free a dead thread's wait records and repair any lock it held */
+     signal_sync( thread->sync );
+     if (violent_death) send_thread_signal( thread, SIGQUIT );
+     cleanup_thread( thread );
+@@ -2479,6 +2481,7 @@ DECL_HANDLER(get_inproc_alert_fd)
+ 
+     if ((fd = get_inproc_sync_fd( current->alert_sync )) < 0) set_error( STATUS_INVALID_PARAMETER );
+     else if (do_fsync()) reply->fsync_shm_idx = fd;
++    else if (gameos_gsync_active()) reply->fsync_shm_idx = fd; /* GameOS Sync handle */
+     else
+     {
+         reply->handle = get_thread_id( current ) | 1; /* arbitrary token */

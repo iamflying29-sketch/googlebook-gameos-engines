@@ -324,6 +324,69 @@ diff -ruN glibc-2.44/sysdeps/nptl/dl-tunables.list glibc-2.44-gameos/sysdeps/npt
      }
      stack_hugetlb {
        type: INT_32
+diff -ruN glibc-2.44/sysdeps/unix/sysv/linux/execve.c glibc-2.44-gameos/sysdeps/unix/sysv/linux/execve.c
+--- glibc-2.44/sysdeps/unix/sysv/linux/execve.c	1970-01-01 00:00:00.000000000 +0000
++++ glibc-2.44-gameos/sysdeps/unix/sysv/linux/execve.c	2026-10-21 11:52:49.394033137 +0000
+@@ -0,0 +1,59 @@
++/* execve for Linux, with the GameOS runtime fallback.
++   This file is part of the GNU C Library, modified for GameOS.
++
++   The GNU C Library is free software; you can redistribute it and/or
++   modify it under the terms of the GNU Lesser General Public
++   License as published by the Free Software Foundation; either
++   version 2.1 of the License, or (at your option) any later version.  */
++
++#include <errno.h>
++#include <string.h>
++#include <unistd.h>
++#include <sysdep.h>
++
++/* GameOS: Android forbids apps to execute files from their own storage (EACCES), but the runtime's glibc loader
++   lives in the app's native library folder, where executing is allowed. When the direct execve is refused with
++   EACCES and the environment names GAMEOS_LOADER and GAMEOS_LIBRARY_PATH, the program is started through that
++   loader instead, keeping its argv[0]. Only stack memory is used, so this is safe after vfork.  */
++int
++__execve (const char *path, char *const argv[], char *const envp[])
++{
++  int ret = INLINE_SYSCALL_CALL (execve, path, argv, envp);
++  if (ret != -1 || errno != EACCES || envp == NULL || path == NULL)
++    return ret;
++
++  const char *loader = NULL, *libpath = NULL;
++  for (char *const *e = envp; *e != NULL; e++)
++    {
++      if (strncmp (*e, "GAMEOS_LOADER=", 14) == 0)
++        loader = *e + 14;
++      else if (strncmp (*e, "GAMEOS_LIBRARY_PATH=", 20) == 0)
++        libpath = *e + 20;
++    }
++  if (loader == NULL || libpath == NULL || strcmp (path, loader) == 0)
++    {
++      __set_errno (EACCES);
++      return -1;
++    }
++
++  size_t argc = 0;
++  if (argv != NULL)
++    while (argv[argc] != NULL)
++      argc++;
++  const char *nargv[argc + 8];
++  size_t n = 0;
++  nargv[n++] = loader;
++  nargv[n++] = "--library-path";
++  nargv[n++] = libpath;
++  if (argc > 0)
++    {
++      nargv[n++] = "--argv0";
++      nargv[n++] = argv[0];
++    }
++  nargv[n++] = path;
++  for (size_t i = 1; i < argc; i++)
++    nargv[n++] = argv[i];
++  nargv[n] = NULL;
++  return INLINE_SYSCALL_CALL (execve, loader, nargv, envp);
++}
++weak_alias (__execve, execve)
 diff -ruN glibc-2.44/sysdeps/unix/sysv/linux/kernel-features.h glibc-2.44-gameos/sysdeps/unix/sysv/linux/kernel-features.h
 --- glibc-2.44/sysdeps/unix/sysv/linux/kernel-features.h	2026-07-24 13:16:45.000000000 +0000
 +++ glibc-2.44-gameos/sysdeps/unix/sysv/linux/kernel-features.h	2026-10-21 10:03:33.739332531 +0000
@@ -336,6 +399,17 @@ diff -ruN glibc-2.44/sysdeps/unix/sysv/linux/kernel-features.h glibc-2.44-gameos
  
  /* The termios2 interface was introduced across all architectures except
     Alpha in kernel 2.6.22. */
+diff -ruN glibc-2.44/sysdeps/unix/sysv/linux/syscalls.list glibc-2.44-gameos/sysdeps/unix/sysv/linux/syscalls.list
+--- glibc-2.44/sysdeps/unix/sysv/linux/syscalls.list	2026-07-24 13:16:45.000000000 +0000
++++ glibc-2.44-gameos/sysdeps/unix/sysv/linux/syscalls.list	2026-10-21 11:52:39.189991492 +0000
+@@ -9,7 +9,6 @@
+ epoll_create1	EXTRA	epoll_create1	i:i	epoll_create1
+ epoll_ctl	EXTRA	epoll_ctl	i:iiip	epoll_ctl
+ eventfd		EXTRA	eventfd2	i:ii	eventfd
+-execve		-	execve		i:spp	__execve	execve
+ flock		-	flock		i:ii	__flock		flock
+ fsconfig	EXTRA	fsconfig	i:iUsNi	fsconfig
+ fsmount		EXTRA	fsmount		i:iUU	fsmount
 diff -ruN glibc-2.44/sysdeps/unix/sysv/linux/x86_64/64/arch-syscall.h glibc-2.44-gameos/sysdeps/unix/sysv/linux/x86_64/64/arch-syscall.h
 --- glibc-2.44/sysdeps/unix/sysv/linux/x86_64/64/arch-syscall.h	2026-07-24 13:16:45.000000000 +0000
 +++ glibc-2.44-gameos/sysdeps/unix/sysv/linux/x86_64/64/arch-syscall.h	2026-10-21 10:06:42.568258204 +0000

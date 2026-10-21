@@ -55,7 +55,7 @@
 #define GS_ENTRIES (GSYNC_MAX_WAIT_OBJECTS + 1) /* the objects plus the alert */
 #define GS_SLOT_BITS 20u
 #define GS_SLOT_MASK ((1u << GS_SLOT_BITS) - 1)
-#define GS_GEN_MASK ((1u << (32 - GS_SLOT_BITS)) - 1)
+#define GS_GEN_MASK ((1u << (31 - GS_SLOT_BITS)) - 1) /* handles stay positive: Wine stores them as int fds */
 
 enum { GS_FREE = 0, GS_SEM = 1, GS_MUTEX = 2, GS_EVENT = 3 };
 #define GS_CLOSED 0x100u
@@ -353,6 +353,7 @@ static int obj_new(struct gsync_device *dev, uint32_t type, const union gs_state
     }
     struct gs_obj *o = &dev->objs[slot - 1];
     uint32_t gen = (atomic_load(&o->gen) + 1) & GS_GEN_MASK;
+    if (!gen) gen = 1; /* 0 means "never allocated" to the crash repair */
     atomic_store(&o->gen, gen);
     o->any_head = o->any_tail = o->all_head = o->all_tail = 0;
     o->j_kind = J_NONE;

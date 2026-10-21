@@ -12,9 +12,9 @@ and every result is published as a release with a SHA-256 checksum. GameOS downl
 
 | Engine | What it is for | Status |
 |---|---|---|
-| Runtime glibc | The C library that Wine, Mesa and the emulators run on inside the app | Script and patch ready |
+| Runtime glibc | The C library that Wine, Mesa and the emulators run on inside the app | Built and tested on my Googlebook |
 | Mesa Intel Vulkan driver | GameOS's own up-to-date graphics driver for the Googlebook's Intel GPU | Next |
-| Wine with Proton's patches | Runs Windows games, including 32-bit ones | Next |
+| Wine with Proton's patches | Runs Windows games, including 32-bit ones, with GameOS Sync (see `wine/`) | Build script ready |
 | DXVK and VKD3D-Proton | Direct3D 8 to 12 on Vulkan | Next |
 | GameOS Sync | Windows synchronization at ntsync quality without `/dev/ntsync` (see `sync/`) | Working and crash-tested |
 

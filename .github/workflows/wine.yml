@@ -1,0 +1,58 @@
+name: GameOS Wine
+
+on:
+  workflow_dispatch:
+    inputs:
+      release:
+        description: "Publish the result as a GitHub release"
+        type: boolean
+        default: false
+  push:
+    paths:
+      - "wine/**"
+      - "sync/**"
+      - ".github/workflows/wine.yml"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    container: debian:trixie
+    timeout-minutes: 300
+    steps:
+      - name: Install build tools
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends gcc g++ make flex bison gawk python3 git ca-certificates curl \
+            xz-utils patch binutils file autoconf automake pkgconf perl \
+            gcc-mingw-w64-x86-64 gcc-mingw-w64-i686 \
+            libvulkan-dev libwayland-dev libwayland-bin wayland-protocols libxkbcommon-dev libxkbregistry-dev \
+            libegl-dev libfreetype-dev libgnutls28-dev
+      - uses: actions/checkout@v4
+      - name: Build Wine
+        run: WORK=$PWD/work OUT=$PWD/out JOBS=$(nproc) wine/build.sh
+      - name: Package
+        run: |
+          cd out
+          D=$(ls -d wine-gameos-* | tail -1)
+          tar -cJf "$D-x86_64.tar.xz" "$D"
+          sha256sum "$D-x86_64.tar.xz" > "$D-x86_64.tar.xz.sha256"
+          ls -la
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gameos-wine
+          path: out/wine-gameos-*-x86_64.tar.xz*
+          retention-days: 30
+      - name: Release
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.release }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          apt-get install -y --no-install-recommends gh
+          git config --global --add safe.directory "$PWD"
+          F=$(ls out/wine-gameos-*-x86_64.tar.xz)
+          TAG="wine-$(basename "$F" -x86_64.tar.xz | sed 's/^wine-gameos-//')"
+          gh release create "$TAG" "$F" "$F.sha256" --title "GameOS Wine $TAG" \
+            --notes "Proton Wine 11 with GameOS Sync, 32-bit support through wrfsbase and SIGSYS chaining for Android apps."

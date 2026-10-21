@@ -4,3 +4,4 @@ out/
 *.tar.xz
 *.tar.gz
 *.zip
+sync/build/
