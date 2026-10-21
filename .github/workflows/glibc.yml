@@ -1,0 +1,53 @@
+name: GameOS runtime glibc
+
+on:
+  workflow_dispatch:
+    inputs:
+      release:
+        description: "Publish the result as a GitHub release"
+        type: boolean
+        default: false
+  push:
+    paths:
+      - "runtime/glibc/**"
+      - ".github/workflows/glibc.yml"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    container: debian:trixie
+    timeout-minutes: 90
+    steps:
+      - name: Install build tools
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends gcc g++ make gawk bison python3 curl ca-certificates xz-utils patch binutils git
+      - uses: actions/checkout@v4
+      - name: Build glibc
+        run: WORK=$PWD/work OUT=$PWD/out JOBS=$(nproc) runtime/glibc/build.sh
+      - name: Package
+        run: |
+          cd out
+          D=$(ls -d glibc-* | tail -1)
+          tar -cJf "gameos-$D-x86_64.tar.xz" "$D"
+          sha256sum "gameos-$D-x86_64.tar.xz" > "gameos-$D-x86_64.tar.xz.sha256"
+          ls -la
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gameos-glibc
+          path: out/gameos-glibc-*
+          retention-days: 30
+      - name: Release
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.release }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          apt-get install -y --no-install-recommends gh
+          git config --global --add safe.directory "$PWD"
+          F=$(ls out/gameos-glibc-*.tar.xz)
+          TAG="glibc-$(basename "$F" .tar.xz | sed 's/^gameos-glibc-//; s/-x86_64$//')"
+          gh release create "$TAG" "$F" "$F.sha256" --title "GameOS runtime glibc $TAG" \
+            --notes "glibc with the GameOS Android patch (no system calls that Android's app filter traps, plus a SIGSYS translator), 16 KB page alignment and x86-64-v3 code."

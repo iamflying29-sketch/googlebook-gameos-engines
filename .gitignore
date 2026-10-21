@@ -1,0 +1,6 @@
+# Build folders and downloads made by the scripts; never committed.
+work/
+out/
+*.tar.xz
+*.tar.gz
+*.zip

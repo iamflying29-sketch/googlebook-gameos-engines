@@ -1,0 +1,522 @@
+diff -ruN glibc-2.44/elf/libc_early_init.c glibc-2.44-gameos/elf/libc_early_init.c
+--- glibc-2.44/elf/libc_early_init.c	2026-07-24 13:16:45.000000000 +0000
++++ glibc-2.44-gameos/elf/libc_early_init.c	2026-10-21 10:04:12.083523557 +0000
+@@ -24,14 +24,281 @@
+ #include <sys/single_threaded.h>
+ #include <getrandom-internal.h>
+ #include <malloc/malloc-internal.h>
++#include <stdlib.h>
++#include <string.h>
+ 
+ #ifdef SHARED
+ _Bool __libc_initial;
+ #endif
+ 
++#if defined __x86_64__ && defined SHARED
++/* GameOS: Android's seccomp filter for apps traps old x86_64 system calls with SIGSYS.  glibc itself no longer makes
++   them, but Wine, games and static code may.  This handler translates each trapped call into its allowed modern
++   form and returns the result, so the program continues.  Calls with no equivalent return -ENOSYS.  Only raw system
++   calls are used here, so the handler is async-signal-safe.  Set GAMEOS_SYSCALL_LOG=1 to log each call number once.  */
++# include <errno.h>
++# include <fcntl.h>
++# include <signal.h>
++# include <sys/time.h>
++# include <sys/ucontext.h>
++# include <time.h>
++# include <sysdep.h>
++
++# define GAMEOS_NR_POLL 7
++# define GAMEOS_NR_LSTAT 6
++# define GAMEOS_NR_ACCESS 21
++# define GAMEOS_NR_PIPE 22
++# define GAMEOS_NR_SELECT 23
++# define GAMEOS_NR_DUP2 33
++# define GAMEOS_NR_PAUSE 34
++# define GAMEOS_NR_ALARM 37
++# define GAMEOS_NR_FORK 57
++# define GAMEOS_NR_RENAME 82
++# define GAMEOS_NR_MKDIR 83
++# define GAMEOS_NR_RMDIR 84
++# define GAMEOS_NR_CREAT 85
++# define GAMEOS_NR_LINK 86
++# define GAMEOS_NR_UNLINK 87
++# define GAMEOS_NR_SYMLINK 88
++# define GAMEOS_NR_CHMOD 90
++# define GAMEOS_NR_CHOWN 92
++# define GAMEOS_NR_LCHOWN 94
++# define GAMEOS_NR_GETPGRP 111
++# define GAMEOS_NR_UTIME 132
++# define GAMEOS_NR_MKNOD 133
++# define GAMEOS_NR_TIME 201
++# define GAMEOS_NR_EPOLL_CREATE 213
++# define GAMEOS_NR_EPOLL_WAIT 232
++# define GAMEOS_NR_UTIMES 235
++# define GAMEOS_NR_INOTIFY_INIT 253
++# define GAMEOS_NR_FUTIMESAT 261
++# define GAMEOS_NR_SIGNALFD 282
++# define GAMEOS_NR_EVENTFD 284
++
++static int gameos_sigsys_log;
++static unsigned char gameos_sigsys_seen[512];
++
++static void
++gameos_sigsys_note (int nr)
++{
++  if (!gameos_sigsys_log || nr < 0 || nr >= 512 || gameos_sigsys_seen[nr]++)
++    return;
++  char buf[48] = "gameos-sigsys: translated or refused call ";
++  char num[12];
++  int n = 0;
++  unsigned int v = nr;
++  do num[n++] = '0' + v % 10; while ((v /= 10) != 0);
++  char out[64];
++  int len = 0;
++  for (int i = 0; buf[i] != 0 && len < 48; i++)
++    out[len++] = buf[i];
++  while (n > 0)
++    out[len++] = num[--n];
++  out[len++] = '\n';
++  INTERNAL_SYSCALL_CALL (write, 2, out, len);
++}
++
++static long int
++gameos_timeval_to_timespec (const struct timeval *tv, struct timespec *ts)
++{
++  ts->tv_sec = tv->tv_sec;
++  ts->tv_nsec = tv->tv_usec * 1000;
++  return 0;
++}
++
++static void
++gameos_sigsys (int sig, siginfo_t *info, void *ctx)
++{
++  ucontext_t *uc = ctx;
++  greg_t *r = uc->uc_mcontext.gregs;
++  long int a0 = r[REG_RDI], a1 = r[REG_RSI], a2 = r[REG_RDX], a3 = r[REG_R10], a4 = r[REG_R8];
++  long int ret = -ENOSYS;
++  int nr = info->si_syscall;
++  switch (nr)
++    {
++    case GAMEOS_NR_ACCESS:
++      ret = INTERNAL_SYSCALL_CALL (faccessat, AT_FDCWD, a0, a1);
++      break;
++    case GAMEOS_NR_MKDIR:
++      ret = INTERNAL_SYSCALL_CALL (mkdirat, AT_FDCWD, a0, a1);
++      break;
++    case GAMEOS_NR_RMDIR:
++      ret = INTERNAL_SYSCALL_CALL (unlinkat, AT_FDCWD, a0, AT_REMOVEDIR);
++      break;
++    case GAMEOS_NR_UNLINK:
++      ret = INTERNAL_SYSCALL_CALL (unlinkat, AT_FDCWD, a0, 0);
++      break;
++    case GAMEOS_NR_RENAME:
++      ret = INTERNAL_SYSCALL_CALL (renameat, AT_FDCWD, a0, AT_FDCWD, a1);
++      break;
++    case GAMEOS_NR_LINK:
++      ret = INTERNAL_SYSCALL_CALL (linkat, AT_FDCWD, a0, AT_FDCWD, a1, 0);
++      break;
++    case GAMEOS_NR_SYMLINK:
++      ret = INTERNAL_SYSCALL_CALL (symlinkat, a0, AT_FDCWD, a1);
++      break;
++    case GAMEOS_NR_CHMOD:
++      ret = INTERNAL_SYSCALL_CALL (fchmodat, AT_FDCWD, a0, a1);
++      break;
++    case GAMEOS_NR_CHOWN:
++      ret = INTERNAL_SYSCALL_CALL (fchownat, AT_FDCWD, a0, a1, a2, 0);
++      break;
++    case GAMEOS_NR_LCHOWN:
++      ret = INTERNAL_SYSCALL_CALL (fchownat, AT_FDCWD, a0, a1, a2, AT_SYMLINK_NOFOLLOW);
++      break;
++    case GAMEOS_NR_CREAT:
++      ret = INTERNAL_SYSCALL_CALL (openat, AT_FDCWD, a0, O_CREAT | O_WRONLY | O_TRUNC, a1);
++      break;
++    case GAMEOS_NR_MKNOD:
++      ret = INTERNAL_SYSCALL_CALL (mknodat, AT_FDCWD, a0, a1, a2);
++      break;
++    case GAMEOS_NR_LSTAT:
++      ret = INTERNAL_SYSCALL_CALL (newfstatat, AT_FDCWD, a0, a1, AT_SYMLINK_NOFOLLOW);
++      break;
++    case GAMEOS_NR_POLL:
++      {
++        struct timespec ts, *tp = NULL;
++        if ((int) a2 >= 0)
++          {
++            ts.tv_sec = (int) a2 / 1000;
++            ts.tv_nsec = ((int) a2 % 1000) * 1000000L;
++            tp = &ts;
++          }
++        ret = INTERNAL_SYSCALL_CALL (ppoll, a0, a1, tp, NULL, 0);
++      }
++      break;
++    case GAMEOS_NR_SELECT:
++      {
++        struct timespec ts, *tp = NULL;
++        struct timeval *tv = (struct timeval *) a4;
++        if (tv != NULL)
++          {
++            gameos_timeval_to_timespec (tv, &ts);
++            tp = &ts;
++          }
++        ret = INTERNAL_SYSCALL_CALL (pselect6, a0, a1, a2, a3, tp, NULL);
++        if (tv != NULL)
++          {
++            tv->tv_sec = ts.tv_sec;
++            tv->tv_usec = ts.tv_nsec / 1000;
++          }
++      }
++      break;
++    case GAMEOS_NR_PIPE:
++      ret = INTERNAL_SYSCALL_CALL (pipe2, a0, 0);
++      break;
++    case GAMEOS_NR_DUP2:
++      if (a0 == a1)
++        {
++          ret = INTERNAL_SYSCALL_CALL (fcntl, a0, F_GETFD);
++          if (ret >= 0)
++            ret = a1;
++        }
++      else
++        ret = INTERNAL_SYSCALL_CALL (dup3, a0, a1, 0);
++      break;
++    case GAMEOS_NR_PAUSE:
++      ret = INTERNAL_SYSCALL_CALL (ppoll, NULL, 0, NULL, NULL, 0);
++      break;
++    case GAMEOS_NR_ALARM:
++      {
++        struct itimerval nv = { { 0, 0 }, { (unsigned int) a0, 0 } }, ov;
++        ret = INTERNAL_SYSCALL_CALL (setitimer, ITIMER_REAL, &nv, &ov);
++        if (ret == 0)
++          ret = ov.it_value.tv_sec + (ov.it_value.tv_usec >= 500000
++                                      || (ov.it_value.tv_sec == 0 && ov.it_value.tv_usec > 0));
++      }
++      break;
++    case GAMEOS_NR_FORK:
++      ret = INTERNAL_SYSCALL_CALL (clone, SIGCHLD, 0, NULL, NULL, 0);
++      break;
++    case GAMEOS_NR_GETPGRP:
++      ret = INTERNAL_SYSCALL_CALL (getpgid, 0);
++      break;
++    case GAMEOS_NR_TIME:
++      {
++        struct timespec ts;
++        ret = INTERNAL_SYSCALL_CALL (clock_gettime, CLOCK_REALTIME, &ts);
++        if (ret == 0)
++          {
++            ret = ts.tv_sec;
++            if (a0 != 0)
++              *(time_t *) a0 = ts.tv_sec;
++          }
++      }
++      break;
++    case GAMEOS_NR_UTIME:
++      {
++        struct timespec ts[2];
++        const long int *ut = (const long int *) a1;
++        if (ut != NULL)
++          {
++            ts[0].tv_sec = ut[0]; ts[0].tv_nsec = 0;
++            ts[1].tv_sec = ut[1]; ts[1].tv_nsec = 0;
++          }
++        ret = INTERNAL_SYSCALL_CALL (utimensat, AT_FDCWD, a0, ut != NULL ? ts : NULL, 0);
++      }
++      break;
++    case GAMEOS_NR_UTIMES:
++    case GAMEOS_NR_FUTIMESAT:
++      {
++        int dirfd = nr == GAMEOS_NR_UTIMES ? AT_FDCWD : (int) a0;
++        long int path = nr == GAMEOS_NR_UTIMES ? a0 : a1;
++        const struct timeval *tv = (const struct timeval *) (nr == GAMEOS_NR_UTIMES ? a1 : a2);
++        struct timespec ts[2];
++        if (tv != NULL)
++          {
++            gameos_timeval_to_timespec (&tv[0], &ts[0]);
++            gameos_timeval_to_timespec (&tv[1], &ts[1]);
++          }
++        ret = INTERNAL_SYSCALL_CALL (utimensat, dirfd, path, tv != NULL ? ts : NULL, 0);
++      }
++      break;
++    case GAMEOS_NR_EPOLL_CREATE:
++      ret = (int) a0 <= 0 ? -EINVAL : INTERNAL_SYSCALL_CALL (epoll_create1, 0);
++      break;
++    case GAMEOS_NR_EPOLL_WAIT:
++      ret = INTERNAL_SYSCALL_CALL (epoll_pwait, a0, a1, a2, a3, NULL, 0);
++      break;
++    case GAMEOS_NR_INOTIFY_INIT:
++      ret = INTERNAL_SYSCALL_CALL (inotify_init1, 0);
++      break;
++    case GAMEOS_NR_SIGNALFD:
++      ret = INTERNAL_SYSCALL_CALL (signalfd4, a0, a1, a2, 0);
++      break;
++    case GAMEOS_NR_EVENTFD:
++      ret = INTERNAL_SYSCALL_CALL (eventfd2, a0, 0);
++      break;
++    default:
++      ret = -ENOSYS;
++      break;
++    }
++  gameos_sigsys_note (nr);
++  r[REG_RAX] = ret;
++}
++
++static void
++gameos_sigsys_install (void)
++{
++  const char *log = getenv ("GAMEOS_SYSCALL_LOG");
++  gameos_sigsys_log = log != NULL && log[0] == '1';
++  struct sigaction sa;
++  memset (&sa, 0, sizeof sa);
++  sa.sa_sigaction = gameos_sigsys;
++  sa.sa_flags = SA_SIGINFO;
++  __sigaction (SIGSYS, &sa, NULL);
++}
++#endif
++
+ void
+ __libc_early_init (_Bool initial)
+ {
++#if defined __x86_64__ && defined SHARED
++  /* GameOS: install the SIGSYS translator before any other start-up work.  */
++  if (initial)
++    gameos_sigsys_install ();
++#endif
++
+   /* Initialize ctype data.  */
+   __ctype_init ();
+ 
+diff -ruN glibc-2.44/sysdeps/nptl/_Fork.c glibc-2.44-gameos/sysdeps/nptl/_Fork.c
+--- glibc-2.44/sysdeps/nptl/_Fork.c	2026-07-24 13:16:45.000000000 +0000
++++ glibc-2.44-gameos/sysdeps/nptl/_Fork.c	2026-10-21 10:03:33.739332531 +0000
+@@ -49,8 +49,9 @@
+       self->robust_prev = &self->robust_head;
+ #endif
+       self->robust_head.list = &self->robust_head;
+-      INTERNAL_SYSCALL_CALL (set_robust_list, &self->robust_head,
+-			     sizeof (struct robust_list_head));
++      if (__nptl_set_robust_list_avail)
++	INTERNAL_SYSCALL_CALL (set_robust_list, &self->robust_head,
++			       sizeof (struct robust_list_head));
+       call_function_static_weak (__getrandom_fork_subprocess);
+     }
+ 
+diff -ruN glibc-2.44/sysdeps/nptl/dl-tls_init_tp.c glibc-2.44-gameos/sysdeps/nptl/dl-tls_init_tp.c
+--- glibc-2.44/sysdeps/nptl/dl-tls_init_tp.c	2026-07-24 13:16:45.000000000 +0000
++++ glibc-2.44-gameos/sysdeps/nptl/dl-tls_init_tp.c	2026-10-21 10:03:33.739332531 +0000
+@@ -92,8 +92,8 @@
+     pd->robust_head.futex_offset = (offsetof (pthread_mutex_t, __data.__lock)
+                                     - offsetof (pthread_mutex_t,
+                                                 __data.__list.__next));
+-    int res = INTERNAL_SYSCALL_CALL (set_robust_list, &pd->robust_head,
+-                                     sizeof (struct robust_list_head));
++    /* GameOS: Android's app seccomp filter traps set_robust_list; report it as unavailable.  */
++    int res = -ENOSYS;
+     if (!INTERNAL_SYSCALL_ERROR_P (res))
+       {
+ #ifndef __ASSUME_SET_ROBUST_LIST
+diff -ruN glibc-2.44/sysdeps/nptl/dl-tunables.list glibc-2.44-gameos/sysdeps/nptl/dl-tunables.list
+--- glibc-2.44/sysdeps/nptl/dl-tunables.list	2026-07-24 13:16:45.000000000 +0000
++++ glibc-2.44-gameos/sysdeps/nptl/dl-tunables.list	2026-10-21 10:03:33.739332531 +0000
+@@ -31,7 +31,7 @@
+       type: INT_32
+       minval: 0
+       maxval: 1
+-      default: 1
++      default: 0
+     }
+     stack_hugetlb {
+       type: INT_32
+diff -ruN glibc-2.44/sysdeps/unix/sysv/linux/kernel-features.h glibc-2.44-gameos/sysdeps/unix/sysv/linux/kernel-features.h
+--- glibc-2.44/sysdeps/unix/sysv/linux/kernel-features.h	2026-07-24 13:16:45.000000000 +0000
++++ glibc-2.44-gameos/sysdeps/unix/sysv/linux/kernel-features.h	2026-10-21 10:03:33.739332531 +0000
+@@ -52,7 +52,7 @@
+ /* Support for inter-process robust mutexes was added in 2.6.17 (but
+    some architectures lack futex_atomic_cmpxchg_inatomic in some
+    configurations).  */
+-#define __ASSUME_SET_ROBUST_LIST	1
++/* GameOS: Android's app seccomp filter traps set_robust_list, so it is never assumed.  */
+ 
+ /* The termios2 interface was introduced across all architectures except
+    Alpha in kernel 2.6.22. */
+diff -ruN glibc-2.44/sysdeps/unix/sysv/linux/x86_64/64/arch-syscall.h glibc-2.44-gameos/sysdeps/unix/sysv/linux/x86_64/64/arch-syscall.h
+--- glibc-2.44/sysdeps/unix/sysv/linux/x86_64/64/arch-syscall.h	2026-07-24 13:16:45.000000000 +0000
++++ glibc-2.44-gameos/sysdeps/unix/sysv/linux/x86_64/64/arch-syscall.h	2026-10-21 10:06:42.568258204 +0000
+@@ -1,13 +1,12 @@
+ /* AUTOGENERATED by update-syscall-lists.py.  */
++/* GameOS: legacy calls that Android traps for apps are hidden here so the *at forms are used.  */
+ #define __NR__sysctl 156
+ #define __NR_accept 43
+ #define __NR_accept4 288
+-#define __NR_access 21
+ #define __NR_acct 163
+ #define __NR_add_key 248
+ #define __NR_adjtimex 159
+ #define __NR_afs_syscall 183
+-#define __NR_alarm 37
+ #define __NR_arch_prctl 158
+ #define __NR_bind 49
+ #define __NR_bpf 321
+@@ -16,8 +15,6 @@
+ #define __NR_capget 125
+ #define __NR_capset 126
+ #define __NR_chdir 80
+-#define __NR_chmod 90
+-#define __NR_chown 92
+ #define __NR_chroot 161
+ #define __NR_clock_adjtime 305
+ #define __NR_clock_getres 229
+@@ -30,21 +27,16 @@
+ #define __NR_close_range 436
+ #define __NR_connect 42
+ #define __NR_copy_file_range 326
+-#define __NR_creat 85
+ #define __NR_create_module 174
+ #define __NR_delete_module 176
+ #define __NR_dup 32
+-#define __NR_dup2 33
+ #define __NR_dup3 292
+-#define __NR_epoll_create 213
+ #define __NR_epoll_create1 291
+ #define __NR_epoll_ctl 233
+ #define __NR_epoll_ctl_old 214
+ #define __NR_epoll_pwait 281
+ #define __NR_epoll_pwait2 441
+-#define __NR_epoll_wait 232
+ #define __NR_epoll_wait_old 215
+-#define __NR_eventfd 284
+ #define __NR_eventfd2 290
+ #define __NR_execve 59
+ #define __NR_execveat 322
+@@ -70,7 +62,6 @@
+ #define __NR_finit_module 313
+ #define __NR_flistxattr 196
+ #define __NR_flock 73
+-#define __NR_fork 57
+ #define __NR_fremovexattr 199
+ #define __NR_fsconfig 431
+ #define __NR_fsetxattr 190
+@@ -86,7 +77,6 @@
+ #define __NR_futex_wait 455
+ #define __NR_futex_waitv 449
+ #define __NR_futex_wake 454
+-#define __NR_futimesat 261
+ #define __NR_get_kernel_syms 177
+ #define __NR_get_mempolicy 239
+ #define __NR_get_robust_list 274
+@@ -102,7 +92,6 @@
+ #define __NR_getitimer 36
+ #define __NR_getpeername 52
+ #define __NR_getpgid 121
+-#define __NR_getpgrp 111
+ #define __NR_getpid 39
+ #define __NR_getpmsg 181
+ #define __NR_getppid 110
+@@ -122,7 +111,6 @@
+ #define __NR_getxattrat 464
+ #define __NR_init_module 175
+ #define __NR_inotify_add_watch 254
+-#define __NR_inotify_init 253
+ #define __NR_inotify_init1 294
+ #define __NR_inotify_rm_watch 255
+ #define __NR_io_cancel 210
+@@ -147,9 +135,7 @@
+ #define __NR_landlock_add_rule 445
+ #define __NR_landlock_create_ruleset 444
+ #define __NR_landlock_restrict_self 446
+-#define __NR_lchown 94
+ #define __NR_lgetxattr 192
+-#define __NR_link 86
+ #define __NR_linkat 265
+ #define __NR_listen 50
+ #define __NR_listmount 458
+@@ -164,7 +150,6 @@
+ #define __NR_lsm_get_self_attr 459
+ #define __NR_lsm_list_modules 461
+ #define __NR_lsm_set_self_attr 460
+-#define __NR_lstat 6
+ #define __NR_madvise 28
+ #define __NR_map_shadow_stack 453
+ #define __NR_mbind 237
+@@ -173,9 +158,7 @@
+ #define __NR_memfd_secret 447
+ #define __NR_migrate_pages 256
+ #define __NR_mincore 27
+-#define __NR_mkdir 83
+ #define __NR_mkdirat 258
+-#define __NR_mknod 133
+ #define __NR_mknodat 259
+ #define __NR_mlock 149
+ #define __NR_mlock2 325
+@@ -213,19 +196,16 @@
+ #define __NR_open_tree_attr 467
+ #define __NR_openat 257
+ #define __NR_openat2 437
+-#define __NR_pause 34
+ #define __NR_perf_event_open 298
+ #define __NR_personality 135
+ #define __NR_pidfd_getfd 438
+ #define __NR_pidfd_open 434
+ #define __NR_pidfd_send_signal 424
+-#define __NR_pipe 22
+ #define __NR_pipe2 293
+ #define __NR_pivot_root 155
+ #define __NR_pkey_alloc 330
+ #define __NR_pkey_free 331
+ #define __NR_pkey_mprotect 329
+-#define __NR_poll 7
+ #define __NR_ppoll 271
+ #define __NR_prctl 157
+ #define __NR_pread64 17
+@@ -257,12 +237,10 @@
+ #define __NR_remap_file_pages 216
+ #define __NR_removexattr 197
+ #define __NR_removexattrat 466
+-#define __NR_rename 82
+ #define __NR_renameat 264
+ #define __NR_renameat2 316
+ #define __NR_request_key 249
+ #define __NR_restart_syscall 219
+-#define __NR_rmdir 84
+ #define __NR_rseq 334
+ #define __NR_rseq_slice_yield 471
+ #define __NR_rt_sigaction 13
+@@ -287,7 +265,6 @@
+ #define __NR_sched_yield 24
+ #define __NR_seccomp 317
+ #define __NR_security 185
+-#define __NR_select 23
+ #define __NR_semctl 66
+ #define __NR_semget 64
+ #define __NR_semop 65
+@@ -328,7 +305,6 @@
+ #define __NR_shmget 29
+ #define __NR_shutdown 48
+ #define __NR_sigaltstack 131
+-#define __NR_signalfd 282
+ #define __NR_signalfd4 289
+ #define __NR_socket 41
+ #define __NR_socketpair 53
+@@ -339,7 +315,6 @@
+ #define __NR_statx 332
+ #define __NR_swapoff 168
+ #define __NR_swapon 167
+-#define __NR_symlink 88
+ #define __NR_symlinkat 266
+ #define __NR_sync 162
+ #define __NR_sync_file_range 277
+@@ -365,7 +340,6 @@
+ #define __NR_umask 95
+ #define __NR_umount2 166
+ #define __NR_uname 63
+-#define __NR_unlink 87
+ #define __NR_unlinkat 263
+ #define __NR_unshare 272
+ #define __NR_uprobe 336
+@@ -373,9 +347,7 @@
+ #define __NR_uselib 134
+ #define __NR_userfaultfd 323
+ #define __NR_ustat 136
+-#define __NR_utime 132
+ #define __NR_utimensat 280
+-#define __NR_utimes 235
+ #define __NR_vfork 58
+ #define __NR_vhangup 153
+ #define __NR_vmsplice 278
